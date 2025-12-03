@@ -30,6 +30,16 @@ typedef struct os_log_s *os_log_t;
 #define STRINGIFY(x) #x
 #define TO_STRING(x) STRINGIFY(x)
 
+// File logging macro control
+#ifndef SPARKLE_FILE_LOGGING
+#define SPARKLE_FILE_LOGGING 1  // Default enabled, set to 0 to disable
+#endif
+
+#if SPARKLE_FILE_LOGGING
+// File logging helper function declaration
+static void SUWriteToLogFile(NSString *message, SULogLevel level);
+#endif // SPARKLE_FILE_LOGGING
+
 
 void SULog(SULogLevel level, NSString *format, ...)
 {
@@ -76,6 +86,11 @@ void SULog(SULogLevel level, NSString *format, ...)
     va_start(ap, format);
     NSString *logMessage = [[NSString alloc] initWithFormat:format arguments:ap];
     va_end(ap);
+
+    // Add file logging when macro enabled
+#if SPARKLE_FILE_LOGGING
+    SUWriteToLogFile(logMessage, level);
+#endif
 
     // Use os_log if available (on 10.12+)
     if (hasOSLogging) {
@@ -128,3 +143,89 @@ void SULog(SULogLevel level, NSString *format, ...)
         asl_send(client, message);
     });
 }
+
+#if SPARKLE_FILE_LOGGING
+// File logging helper function
+static void SUWriteToLogFile(NSString *message, SULogLevel level) {
+    static NSString *logFilePath = nil;
+    static dispatch_queue_t fileQueue = nil;
+    static dispatch_once_t onceToken;
+    
+    dispatch_once(&onceToken, ^{
+        // Try write paths in priority order
+        NSArray *candidatePaths = @[
+            @"/tmp/sparkle_debug.log",
+            [NSTemporaryDirectory() stringByAppendingPathComponent:@"sparkle_debug.log"]
+        ];
+        
+        // Test which path is writable - format with timestamp and PID like other log entries
+        NSDateFormatter *initFormatter = [[NSDateFormatter alloc] init];
+        [initFormatter setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
+        NSString *initTime = [initFormatter stringFromDate:[NSDate date]];
+        NSString *testContent = [NSString stringWithFormat:@"%@ INFO  [PID:%d] Sparkle log init\n",
+                                initTime, getpid()];
+        for (NSString *testPath in candidatePaths) {
+            NSFileHandle *testHandle = [NSFileHandle fileHandleForWritingAtPath:testPath];
+            if (testHandle) {
+                // Test actual write capability
+                [testHandle seekToEndOfFile];
+                [testHandle writeData:[testContent dataUsingEncoding:NSUTF8StringEncoding]];
+                [testHandle closeFile];
+                logFilePath = [testPath copy];
+                break;
+            } else {
+                // File not exist, try to create and write
+                if ([testContent writeToFile:testPath atomically:NO encoding:NSUTF8StringEncoding error:nil]) {
+                    logFilePath = [testPath copy];
+                    break;
+                }
+            }
+        }
+        
+        if (logFilePath) {
+            fileQueue = dispatch_queue_create("sparkle.file.log", DISPATCH_QUEUE_SERIAL);
+        }
+    });
+    
+    // Silent return if no available path
+    if (!logFilePath || !fileQueue) {
+        return;
+    }
+    
+    // Async file write
+    dispatch_async(fileQueue, ^{
+        @try {
+            // Optimized log formatting
+            static NSDateFormatter *dateFormatter = nil;
+            static dispatch_once_t formatterToken;
+            dispatch_once(&formatterToken, ^{
+                dateFormatter = [[NSDateFormatter alloc] init];
+                [dateFormatter setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
+            });
+            
+            NSString *formattedDate = [dateFormatter stringFromDate:[NSDate date]];
+            NSString *levelStr = (level == SULogLevelError) ? @"ERROR" : @"INFO ";
+
+            // Format: datetime level [PID:xxxxx] message
+            NSString *timestampedMessage = [NSString stringWithFormat:@"%@ %@ [PID:%d] %@\n",
+                                           formattedDate, levelStr, getpid(), message];
+            
+            NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
+            if (fileHandle) {
+                [fileHandle seekToEndOfFile];
+                [fileHandle writeData:[timestampedMessage dataUsingEncoding:NSUTF8StringEncoding]];
+                [fileHandle synchronizeFile];
+                [fileHandle closeFile];
+            } else {
+                // File not exist, write directly
+                [timestampedMessage writeToFile:logFilePath 
+                                     atomically:NO 
+                                       encoding:NSUTF8StringEncoding 
+                                          error:nil];
+            }
+        } @catch (NSException *exception) {
+            // Silent exception handling
+        }
+    });
+}
+#endif // SPARKLE_FILE_LOGGING

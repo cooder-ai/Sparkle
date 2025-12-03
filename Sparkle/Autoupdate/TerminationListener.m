@@ -55,9 +55,12 @@
 
 - (void)startListeningWithCompletion:(void (^)(BOOL))completionBlock
 {
+    SULog(SULogLevelDefault, @"Starting process termination listener for PID: %@", self.processIdentifier);
+    
     self.completionBlock = completionBlock;
     
     if (self.processIdentifier == nil) {
+        SULog(SULogLevelDefault, @"No PID to monitor, completing immediately");
         [self invokeCompletionWithSuccess:YES];
         return;
     }
@@ -69,7 +72,7 @@
     pid_t processIdentifier = self.processIdentifier.intValue;
     int queue = kqueue();
     if (queue == -1) {
-        SULog(SULogLevelError, @"Failed to create kqueue() due to error %d: %@", errno, @(strerror(errno)));
+        SULog(SULogLevelError, @"Failed to create kqueue, error %d: %@", errno, @(strerror(errno)));
         [self invokeCompletionWithSuccess:NO];
         return;
     }
@@ -78,7 +81,7 @@
     EV_SET(&changes, processIdentifier, EVFILT_PROC, EV_ADD | EV_RECEIPT, NOTE_EXIT, 0, NULL);
     
     if (kevent(queue, &changes, 1, &changes, 1, NULL) == -1) {
-        SULog(SULogLevelError, @"Failed to invoke kevent() due to error %d: %@", errno, @(strerror(errno)));
+        SULog(SULogLevelError, @"Failed to invoke kevent, error %d: %@", errno, @(strerror(errno)));
         [self invokeCompletionWithSuccess:NO];
         return;
     }
@@ -90,7 +93,7 @@
 #pragma clang diagnostic pop
     CFFileDescriptorRef noteExitKQueueRef = CFFileDescriptorCreate(NULL, queue, true, noteExitKQueueCallback, &context);
     if (noteExitKQueueRef == NULL) {
-        SULog(SULogLevelError, @"Failed to create file descriptor via CFFileDescriptorCreate()");
+        SULog(SULogLevelError, @"Failed to create file descriptor via CFFileDescriptorCreate");
         CFRelease((__bridge CFTypeRef)(self));
         [self invokeCompletionWithSuccess:NO];
         return;
@@ -98,7 +101,7 @@
     
     CFRunLoopSourceRef runLoopSource = CFFileDescriptorCreateRunLoopSource(NULL, noteExitKQueueRef, 0);
     if (runLoopSource == NULL) {
-        SULog(SULogLevelError, @"Failed to create runLoopSource via CFFileDescriptorCreateRunLoopSource()");
+        SULog(SULogLevelError, @"Failed to create runLoopSource via CFFileDescriptorCreateRunLoopSource");
         CFRelease((__bridge CFTypeRef)(self));
         [self invokeCompletionWithSuccess:NO];
         return;
@@ -109,16 +112,28 @@
     
     CFFileDescriptorEnableCallBacks(noteExitKQueueRef, kCFFileDescriptorReadCallBack);
     
+    SULog(SULogLevelDefault, @"kqueue listener set up, waiting for process %@ to exit", self.processIdentifier);
+    
     // Make sure we didn't set the listener callback to a dead PID
     // If we did, we could hang forever. To avoid this, we check if the process has terminated *after* we set up the callback
     // If we tried to do this check before setting the callback, we could run into an issue where the process can terminate after our check
     // but before setting the callback
-    if ([self terminated]) {
+    BOOL immediatelyTerminated = [self terminated];
+    SULog(SULogLevelDefault, @"Immediate process check: %@", immediatelyTerminated ? @"TERMINATED" : @"RUNNING");
+    
+    if (immediatelyTerminated) {
+        SULog(SULogLevelDefault, @"Process already terminated, completing listener");
         [self invokeCompletionWithSuccess:YES];
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if ([self terminated]) {
+        BOOL delayedTerminated = [self terminated];
+        SULog(SULogLevelDefault, @"2s delayed process check: %@", delayedTerminated ? @"TERMINATED" : @"RUNNING");
+        
+        if (delayedTerminated) {
+            SULog(SULogLevelDefault, @"Process terminated via delayed check");
             [self invokeCompletionWithSuccess:YES];
+        } else {
+            SULog(SULogLevelDefault, @"Process %@ still running, waiting for kqueue events", self.processIdentifier);
         }
     });
 }
@@ -129,6 +144,8 @@ static void noteExitKQueueCallback(CFFileDescriptorRef file, CFOptionFlags __unu
     kevent(CFFileDescriptorGetNativeDescriptor(file), NULL, 0, &event, 1, NULL);
     
     TerminationListener *self = CFBridgingRelease(info);
+    SULog(SULogLevelDefault, @"kqueue detected process %@ exit event", self.processIdentifier);
+    
     self.watchedTermination = YES;
     [self invokeCompletionWithSuccess:YES];
 }
